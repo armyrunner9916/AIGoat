@@ -3,7 +3,8 @@ name: 'Terraform Apply'
 on:
   workflow_dispatch:
 
-permissions: write-all
+permissions:
+  write-all
 
 jobs:
   terraform:
@@ -21,20 +22,26 @@ jobs:
         working-directory: ./terraform
 
     steps:
-    - name: Checkout
-      uses: actions/checkout@v3
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    # --- ADD THIS STEP: Setup Terraform ---
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      #  with:
+      #    terraform_version: "1.8.0" # Optional: Specify Terraform version
 
     - name: Set Account ID
       id: account
       run: |
-        echo "ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)" >> $GITHUB_OUTPUT
+        echo "ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)" >> "$GITHUB_OUTPUT"
 
     - name: Create S3 bucket for Terraform state
       run: |
         BUCKET_NAME="aigoat-state-files-${{ steps.account.outputs.ACCOUNT_ID }}"
         if ! aws s3api head-bucket --bucket "$BUCKET_NAME" 2>/dev/null; then
           echo "Creating S3 bucket: $BUCKET_NAME"
-          aws s3api create-bucket --bucket "$BUCKET_NAME" --region $AWS_REGION
+          aws s3api create-bucket --bucket "$BUCKET_NAME" --region "$AWS_REGION"
         else
           echo "S3 bucket already exists: $BUCKET_NAME"
         fi
@@ -42,18 +49,16 @@ jobs:
     - name: Check for existing state file
       id: check_state
       run: |
-        if aws s3api head-object --bucket aigoat-state-files-${{ steps.account.outputs.ACCOUNT_ID }} --key terraform.tfstate 2>/dev/null; then
+        if aws s3api head-object --bucket "aigoat-state-files-${{ steps.account.outputs.ACCOUNT_ID }}" --key "terraform.tfstate" 2>/dev/null; then
           echo "State file exists. Will use existing state."
-          echo "STATE_EXISTS=true" >> $GITHUB_OUTPUT
+          echo "STATE_EXISTS=true" >> "$GITHUB_OUTPUT"
         else
           echo "No state file found. Will create new deployment."
-          echo "STATE_EXISTS=false" >> $GITHUB_OUTPUT
+          echo "STATE_EXISTS=false" >> "$GITHUB_OUTPUT"
         fi
 
     - name: Setup Python
-      uses: actions/setup-python@v2
-      with:
-        python-version: 3
+      uses: actions/setup-python@v4 # Use v4
 
     - name: Install boto3
       run: pip install boto3
@@ -61,24 +66,34 @@ jobs:
     - name: Terraform Operations
       run: |
         set -e  # Exit immediately if a command exits with a non-zero status
-        
+
         # Retrieve existing state if it exists
         if [[ "${{ steps.check_state.outputs.STATE_EXISTS }}" == "true" ]]; then
-          aws s3 cp s3://aigoat-state-files-${{ steps.account.outputs.ACCOUNT_ID }}/terraform.tfstate ./terraform.tfstate || true
+          echo "Downloading terraform.tfstate from S3..." # Added echo for clarity
+          aws s3 cp "s3://aigoat-state-files-${{ steps.account.outputs.ACCOUNT_ID }}/terraform.tfstate" "./terraform.tfstate" || {
+            echo "WARN: Failed to download existing state.  This might be OK for a first-time deployment, but investigate if this happens repeatedly."
+            true # Continue even if download fails.  Consider if this is the right approach.
+          }
+        else
+           echo "No existing state found, starting from scratch."
         fi
         
         # Terraform Init
-        terraform init
-        
+        echo "Initializing Terraform..."
+        terraform init -input=false
+
         # Terraform Plan
-        terraform plan -input=false
-        
+        echo "Running Terraform Plan..."
+        terraform plan -input=false -no-color
+
         # Terraform Apply
-        terraform apply -auto-approve -input=false
-        
+        echo "Running Terraform Apply..."
+        terraform apply -auto-approve -input=false -no-color
+
     - name: Display Terraform Outputs
       id: tf_output
       run: |
+        echo "Fetching Terraform outputs..."
         BUCKET_URL=$(terraform output -raw bucket_url || echo "No bucket_url output")
         BACKEND_IP=$(terraform output -raw backend_ip || echo "No backend_ip output")
         echo "Bucket URL: $BUCKET_URL"
@@ -87,4 +102,5 @@ jobs:
     - name: Copy state file to S3
       if: always()
       run: |
-        aws s3 cp ./terraform.tfstate s3://aigoat-state-files-${{ steps.account.outputs.ACCOUNT_ID }}/terraform.tfstate
+        echo "Copying terraform.tfstate to S3..." # Added echo
+        aws s3 cp "./terraform.tfstate" "s3://aigoat-state-files-${{ steps.account.outputs.ACCOUNT_ID }}/terraform.tfstate"
